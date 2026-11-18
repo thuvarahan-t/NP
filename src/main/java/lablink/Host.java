@@ -208,6 +208,8 @@ public final class Host implements AutoCloseable {
         private long attemptNumber;
         private Peer owner;
         private SwingAttempt active;
+        private String pickedFace;
+        private double target;
         private boolean started;
         private boolean finished;
         private boolean aborted;
@@ -228,10 +230,9 @@ public final class Host implements AutoCloseable {
                 return;
             }
             switch (fields[0]) {
-                case "CLAIM" -> {
-                    if (fields.length == 1) claim(peer);
-                    else error(peer, "BAD_COMMAND");
-                }
+                case "PICK" -> pick(peer, fields);
+                case "FLIP" -> flip(peer, fields);
+                case "TARGET" -> chooseTarget(peer, fields);
                 case "PLAY" -> play(peer, fields);
                 case "PAUSE" -> error(peer, fields.length != 1 ? "BAD_COMMAND" :
                         owner == peer ? "UNSUPPORTED" : "NOT_OWNER");
@@ -281,16 +282,74 @@ public final class Host implements AutoCloseable {
             Peer first = players.get(0);
             String second = players.size() == 2 ? "|" + players.get(1).id + "|" + players.get(1).name : "||";
             broadcast("PLAYERS|" + first.id + "|" + first.name + second);
-            broadcast(players.size() == 2 ? "READY|" + round : "WAITING|" + round);
+            if (players.size() < 2) {
+                broadcast("WAITING|" + round);
+                return;
+            }
+            broadcast("TOSS_PICK|" + round + "|" + first.id);
         }
 
-        private void claim(Peer peer) {
-            if (players.size() != 2 || finished || aborted) error(peer, "ROUND_UNAVAILABLE");
-            else if (owner != null) error(peer, "TURN_TAKEN");
-            else if (peer.score != null) error(peer, "ALREADY_PLAYED");
-            else {
-                owner = peer;
-                broadcast("TURN|" + round + "|" + peer.id);
+        private void pick(Peer peer, String[] fields) {
+            if (players.size() != 2 || pickedFace != null || owner != null || finished || aborted) {
+                error(peer, "PICK_UNAVAILABLE");
+                return;
+            }
+            if (players.get(0) != peer) {
+                error(peer, "NOT_PICKER");
+                return;
+            }
+            if (fields.length != 2 || (!fields[1].equals("HEADS") && !fields[1].equals("TAILS"))) {
+                error(peer, "BAD_COMMAND");
+                return;
+            }
+            pickedFace = fields[1];
+            broadcast("TOSS_READY|" + round + "|" + players.get(1).id + "|" + pickedFace);
+        }
+
+        private void flip(Peer peer, String[] fields) {
+            if (fields.length != 1) {
+                error(peer, "BAD_COMMAND");
+                return;
+            }
+            if (players.size() != 2 || pickedFace == null || target != 0 || owner != null || finished || aborted) {
+                error(peer, "TOSS_UNAVAILABLE");
+                return;
+            }
+            if (players.get(1) != peer) {
+                error(peer, "NOT_FLIPPER");
+                return;
+            }
+            String face = ThreadLocalRandom.current().nextBoolean() ? "HEADS" : "TAILS";
+            owner = players.get(face.equals(pickedFace) ? 0 : 1);
+            broadcast("TOSS|" + round + "|" + owner.id + "|" + face);
+        }
+
+        private void chooseTarget(Peer peer, String[] fields) {
+            if (owner != peer) {
+                error(peer, "NOT_OWNER");
+                return;
+            }
+            if (target != 0) {
+                error(peer, "TARGET_LOCKED");
+                return;
+            }
+            double seconds = fields.length == 2 && fields[1].matches("[0-9]+(\\.[0-9]{1,2})?")
+                    ? number(fields[1]) : Double.NaN;
+            if (!Double.isFinite(seconds) || seconds < Game.MIN_TARGET || seconds > Game.MAX_TARGET) {
+                error(peer, "INVALID_TARGET");
+                return;
+            }
+            target = seconds;
+            started = true;
+            broadcast("TARGET|" + round + "|" + target);
+            broadcast("TURN|" + round + "|" + owner.id);
+        }
+
+        private double number(String value) {
+            try {
+                return value.matches("-?[0-9]+(\\.[0-9]+)?") ? Double.parseDouble(value) : Double.NaN;
+            } catch (NumberFormatException exception) {
+                return Double.NaN;
             }
         }
 
@@ -299,27 +358,29 @@ public final class Host implements AutoCloseable {
                 error(peer, "NOT_OWNER");
                 return;
             }
+            if (target == 0) {
+                error(peer, "SET_TARGET_FIRST");
+                return;
+            }
             if (active != null) {
                 error(peer, "SWING_RUNNING");
                 return;
             }
-            double length;
-            try {
-                length = fields.length == 2 && fields[1].matches("[0-9]+(\\.[0-9]+)?")
-                        ? Double.parseDouble(fields[1]) : Double.NaN;
-            } catch (NumberFormatException exception) {
-                length = Double.NaN;
-            }
+            double length = fields.length == 3 ? number(fields[1]) : Double.NaN;
+            double angle = fields.length == 3 ? number(fields[2]) : Double.NaN;
             if (!Game.validLength(length)) {
                 error(peer, "INVALID_LENGTH");
                 return;
             }
-            started = true;
-            SwingAttempt next = new SwingAttempt(round, ++attemptNumber, peer, Game.period(length),
+            if (!Game.validAngle(angle)) {
+                error(peer, "INVALID_ANGLE");
+                return;
+            }
+            SwingAttempt next = new SwingAttempt(round, ++attemptNumber, peer, length, angle,
                     players.stream().map(player -> player.udpAddress).toList());
             active = next;
-            broadcast("START|" + round + "|" + next.id + "|" + peer.id + "|" + length);
-            next.future = clock.scheduleAtFixedRate(() -> tick(next), 0, 50, TimeUnit.MILLISECONDS);
+            broadcast("START|" + round + "|" + next.id + "|" + peer.id + "|" + length + "|" + angle);
+            next.future = clock.scheduleWithFixedDelay(() -> tick(next), 0, 50, TimeUnit.MILLISECONDS);
         }
 
         private void tick(SwingAttempt swing) {
@@ -330,7 +391,7 @@ public final class Host implements AutoCloseable {
             }
             int sequence = swing.sequence++;
             byte[] payload = ("SAMPLE|" + swing.round + "|" + swing.id + "|" + sequence + "|" +
-                    elapsed + "|" + Game.angle(elapsed / 1000.0, swing.period)).getBytes(StandardCharsets.UTF_8);
+                    elapsed + "|" + swing.motion.advanceTo(elapsed / 1000.0)).getBytes(StandardCharsets.UTF_8);
             for (int i = 0; i < swing.destinations.size(); i++) {
                 if (i == 1 && sequence == skipSample) continue;
                 try {
@@ -351,11 +412,12 @@ public final class Host implements AutoCloseable {
             broadcast("SCORE|" + round + "|" + swing.id + "|" + player.id + "|" + swing.period);
             if (players.stream().allMatch(candidate -> candidate.score != null)) {
                 finished = true;
-                double difference = Game.error(players.get(0).score) - Game.error(players.get(1).score);
+                double difference = Game.error(players.get(0).score, target) - Game.error(players.get(1).score, target);
                 String result = Math.abs(difference) <= 0.000001 ? "TIE" : players.get(difference < 0 ? 0 : 1).id;
                 broadcast("RESULT|" + round + "|" + result);
             } else {
-                broadcast("READY|" + round);
+                owner = players.stream().filter(candidate -> candidate.score == null).findFirst().orElseThrow();
+                broadcast("TURN|" + round + "|" + owner.id);
             }
         }
 
@@ -374,6 +436,7 @@ public final class Host implements AutoCloseable {
                 send(players.get(0), "ADMIN|" + players.get(0).id);
                 broadcast("ABORT|" + round + "|PLAYER_LEFT");
             } else if (!finished) {
+                pickedFace = null;
                 seats();
             } else {
                 send(players.get(0), "ADMIN|" + players.get(0).id);
@@ -383,6 +446,8 @@ public final class Host implements AutoCloseable {
         private void reset() {
             round++;
             owner = null;
+            target = 0;
+            pickedFace = null;
             started = false;
             finished = false;
             aborted = false;
@@ -405,16 +470,18 @@ public final class Host implements AutoCloseable {
         final long id;
         final Peer player;
         final double period;
+        final Game.Motion motion;
         final List<InetSocketAddress> destinations;
         final long start = System.nanoTime();
         ScheduledFuture<?> future;
         int sequence;
 
-        SwingAttempt(long round, long id, Peer player, double period, List<InetSocketAddress> destinations) {
+        SwingAttempt(long round, long id, Peer player, double length, double angle, List<InetSocketAddress> destinations) {
             this.round = round;
             this.id = id;
             this.player = player;
-            this.period = period;
+            this.period = Game.period(length, angle);
+            motion = new Game.Motion(length, angle);
             this.destinations = destinations;
         }
     }

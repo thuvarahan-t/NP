@@ -5,40 +5,56 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.geom.*;
 import java.io.IOException;
 import java.util.*;
-import java.util.List;
 import java.util.concurrent.Executors;
 
 public final class Desktop {
-    private static final Color PAPER = new Color(245, 244, 239);
-    private static final Color WHITE = new Color(253, 252, 248);
-    private static final Color INK = new Color(25, 35, 32);
-    private static final Color MUTED = new Color(83, 95, 87);
-    private static final Color LINE = new Color(220, 223, 212);
-    private static final Color GREEN = new Color(27, 79, 62);
-    private static final Color SOFT = new Color(231, 239, 230);
-    private static final Color ERROR = new Color(151, 54, 40);
+    private static final Color PAPER = new Color(12, 19, 38);
+    private static final Color WHITE = new Color(29, 41, 65);
+    private static final Color INK = new Color(238, 246, 255);
+    private static final Color MUTED = new Color(162, 181, 207);
+    private static final Color LINE = new Color(202, 226, 255, 44);
+    private static final Color GREEN = new Color(117, 235, 212);
+    private static final Color SOFT = new Color(80, 173, 185, 32);
+    private static final Color ERROR = new Color(255, 160, 160);
+    private static final Color GOLD = new Color(237, 181, 84);
+    private static final Color GOLD_EDGE = new Color(159, 96, 30);
     private static final Font BODY = new Font("Segoe UI", Font.PLAIN, 14);
 
     private final JFrame window = new JFrame("LabLink");
     private final JTextField host = field("127.0.0.1", 12);
     private final JTextField port = field("5050", 5);
     private final JTextField name = field("", 11);
-    private final JTextField length = field("0.95", 5);
+    private final JTextField targetField = field("2.00", 5);
+    private final JSlider length = new JSlider(25, 200, 95);
+    private final JLabel lengthReadout = label("0.95 m", 15, true, GREEN);
+    private final JLabel tossReadout = label(" ", 13, true, GREEN);
+    private final JLabel targetReadout = label("Target period  —", 13, false, MUTED);
     private final JLabel status = label("Disconnected", 13, true, MUTED);
     private final JLabel headline = label("Connect to a room", 19, true, INK);
     private final JTextArea details = description();
     private final JLabel feedback = label(" ", 13, false, ERROR);
+    private final Toast notice = new Toast();
     private final JLabel sampleStatus = label("Waiting for a swing", 12, false, MUTED);
     private final JLabel[] players = {label("Waiting for player", 14, true, INK), label("Waiting for player", 14, true, INK)};
     private final JLabel[] times = {label("—", 19, true, GREEN), label("—", 19, true, GREEN)};
     private final JLabel[] errors = {label(" ", 12, false, MUTED), label(" ", 12, false, MUTED)};
     private final JButton connect = button("Connect");
-    private final JButton action = button("Claim turn");
+    private final JButton heads = button("Heads");
+    private final JButton tails = button("Tails");
+    private final JButton flip = button("Flip the coin");
+    private final JButton action = button("Start game");
     private final JButton reset = button("New round");
     private final Scope scope = new Scope();
+    private final javax.swing.Timer tossReveal = new javax.swing.Timer(1350, event -> revealToss());
+    private final javax.swing.Timer noticeExpiry = new javax.swing.Timer(4200, event -> clearNotice());
+    private JPanel targetControls;
+    private JPanel faceControls;
+    private JPanel lengthControls;
     private final java.util.concurrent.ExecutorService network = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(task, "LabLink commands");
         thread.setDaemon(true);
@@ -54,22 +70,39 @@ public final class Desktop {
     private String attempt = "";
     private String winner = "";
     private String admin = "";
+    private String tossWinner = "";
+    private String flipper = "";
+    private String picker = "";
+    private String pickedFace = "";
+    private String coinFace = "";
+    private boolean flipping;
+    private long flipStarted;
+    private long celebrationStarted;
+    private long resultStarted;
+    private double target;
+    private double releaseAngle;
     private boolean ready;
     private boolean ended;
     private boolean pending;
-    private long sequence = -1;
-    private long gaps;
 
     private Desktop(String[] args) {
-        if (args.length > 0) name.setText(args[0]);
+        if (args.length > 0) {
+            name.setText(args[0]);
+            window.setTitle("LabLink — " + args[0]);
+        }
         if (args.length > 1) host.setText(args[1]);
         if (args.length > 2) port.setText(args[2]);
         window.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+        tossReveal.setRepeats(false);
+        noticeExpiry.setRepeats(false);
+        clearNotice();
         window.setMinimumSize(new Dimension(850, 670));
         window.addWindowListener(new WindowAdapter() {
             @Override public void windowClosed(WindowEvent event) {
                 if (connection != null) connection.close();
                 scope.timer.stop();
+                tossReveal.stop();
+                noticeExpiry.stop();
                 network.shutdownNow();
             }
         });
@@ -78,15 +111,35 @@ public final class Desktop {
         window.setLocationByPlatform(true);
         connect.addActionListener(event -> toggleConnection());
         name.addActionListener(event -> { if (connection == null && !pending) toggleConnection(); });
-        length.addActionListener(event -> { if (action.isEnabled() && me.equals(owner)) action.doClick(); });
-        action.addActionListener(event -> play());
+        targetField.addActionListener(event -> { if (action.isEnabled()) action.doClick(); });
+        action.addActionListener(event -> setTarget());
+        flip.addActionListener(event -> command("FLIP"));
+        heads.addActionListener(event -> command("PICK|HEADS"));
+        tails.addActionListener(event -> command("PICK|TAILS"));
+        length.addChangeListener(event -> {
+            double metres = length.getValue() / 100.0;
+            lengthReadout.setText(String.format(Locale.ROOT, "%.2f m", metres));
+            if (canPull()) scope.previewLength = metres;
+            scope.repaint();
+        });
         reset.addActionListener(event -> command("RESET"));
         refresh();
         window.setVisible(true);
     }
 
     private JComponent layout() {
-        JPanel root = new JPanel(new BorderLayout(0, 15));
+        JPanel root = new JPanel(new BorderLayout(0, 15)) {
+            @Override protected void paintComponent(Graphics graphics) {
+                Graphics2D g = (Graphics2D) graphics.create();
+                g.setPaint(new GradientPaint(0, 0, new Color(26, 37, 78), getWidth(), getHeight(), PAPER));
+                g.fillRect(0, 0, getWidth(), getHeight());
+                glow(g, getWidth() * .18f, getHeight() * .38f, Math.max(1, getWidth() * .60f),
+                        new Color(69, 129, 230, 105));
+                glow(g, getWidth() * .92f, getHeight() * .84f, Math.max(1, getWidth() * .55f),
+                        new Color(56, 159, 172, 82));
+                g.dispose();
+            }
+        };
         root.setBackground(PAPER);
         root.setBorder(new EmptyBorder(23, 28, 20, 28));
 
@@ -123,17 +176,66 @@ public final class Desktop {
         content.add(headline);
         content.add(Box.createVerticalStrut(4));
         content.add(details);
-        content.add(Box.createVerticalStrut(14));
-        JLabel lengthLabel = label("PENDULUM LENGTH (m)", 11, true, MUTED);
-        lengthLabel.setLabelFor(length);
-        content.add(lengthLabel);
-        content.add(Box.createVerticalStrut(5));
-        length.setMaximumSize(new Dimension(Integer.MAX_VALUE, 37));
-        length.setAlignmentX(Component.LEFT_ALIGNMENT);
-        content.add(length);
-        content.add(Box.createVerticalStrut(10));
+        content.add(Box.createVerticalStrut(7));
+        content.add(tossReadout);
+        faceControls = transparent(new FlowLayout(FlowLayout.LEFT, 6, 4));
+        faceControls.setAlignmentX(Component.LEFT_ALIGNMENT);
+        faceControls.add(heads);
+        faceControls.add(tails);
+        content.add(faceControls);
+        flip.setAlignmentX(Component.LEFT_ALIGNMENT);
+        content.add(Box.createVerticalStrut(6));
+        content.add(flip);
+        targetControls = surface(new BorderLayout());
+        JPanel targetContent = stack();
+        targetContent.add(label("Select target time", 17, true, INK));
+        targetContent.add(Box.createVerticalStrut(7));
+        targetContent.add(labeled("SECONDS · 1.20–2.90", targetField));
+        targetContent.add(Box.createVerticalStrut(8));
         action.setAlignmentX(Component.LEFT_ALIGNMENT);
-        content.add(action);
+        targetContent.add(action);
+        targetControls.add(targetContent);
+        scope.setLayout(new GridBagLayout());
+        GridBagConstraints popup = new GridBagConstraints();
+        popup.weightx = popup.weighty = 1;
+        popup.anchor = GridBagConstraints.SOUTHEAST;
+        popup.insets = new Insets(0, 0, 9, 7);
+        scope.add(targetControls, popup);
+        lengthControls = stack();
+        lengthControls.add(Box.createVerticalStrut(10));
+        lengthControls.add(label("PENDULUM LENGTH", 11, true, MUTED));
+        lengthControls.add(lengthReadout);
+        length.setOpaque(false);
+        length.setUI(new javax.swing.plaf.basic.BasicSliderUI(length) {
+            @Override public void paintTrack(Graphics graphics) {
+                Graphics2D g = (Graphics2D) graphics.create();
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int y = trackRect.y + trackRect.height / 2 - 2;
+                g.setColor(LINE);
+                g.fillRoundRect(trackRect.x, y, trackRect.width, 4, 4, 4);
+                g.setColor(slider.isEnabled() ? GREEN : MUTED);
+                g.fillRoundRect(trackRect.x, y, thumbRect.x + thumbRect.width / 2 - trackRect.x, 4, 4, 4);
+                g.dispose();
+            }
+            @Override public void paintThumb(Graphics graphics) {
+                Graphics2D g = (Graphics2D) graphics.create();
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                int x = thumbRect.x + thumbRect.width / 2;
+                int y = trackRect.y + trackRect.height / 2;
+                g.setColor(slider.hasFocus() ? INK : slider.isEnabled() ? GREEN : MUTED);
+                g.fillOval(x - 7, y - 7, 14, 14);
+                g.dispose();
+            }
+            @Override public void paintFocus(Graphics graphics) {
+                // The thumb itself carries the focus highlight.
+            }
+        });
+        length.setFocusable(true);
+        length.getAccessibleContext().setAccessibleName("Pendulum length in centimetres");
+        length.setAlignmentX(Component.LEFT_ALIGNMENT);
+        length.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        lengthControls.add(length);
+        content.add(lengthControls);
         content.add(Box.createVerticalStrut(8));
         reset.setAlignmentX(Component.LEFT_ALIGNMENT);
         content.add(reset);
@@ -143,7 +245,7 @@ public final class Desktop {
         JPanel scoresPanel = surface(new BorderLayout());
         JPanel scoreboard = stack();
         scoreboard.add(label("Results", 17, true, INK));
-        scoreboard.add(label("Target period  2.00 s", 13, false, MUTED));
+        scoreboard.add(targetReadout);
         for (int i = 0; i < 2; i++) {
             scoreboard.add(Box.createVerticalStrut(15));
             JPanel row = transparent(new BorderLayout(5, 0));
@@ -157,7 +259,10 @@ public final class Desktop {
         sidebar.add(scoresPanel, BorderLayout.CENTER);
         workspace.add(sidebar, BorderLayout.EAST);
         root.add(workspace, BorderLayout.CENTER);
-        root.add(feedback, BorderLayout.SOUTH);
+        JPanel messages = transparent(new BorderLayout(8, 0));
+        messages.add(feedback, BorderLayout.CENTER);
+        messages.add(notice, BorderLayout.EAST);
+        root.add(messages, BorderLayout.SOUTH);
         return root;
     }
 
@@ -227,7 +332,12 @@ public final class Desktop {
     }
 
     private void clearRound() {
-        owner = attempt = winner = "";
+        owner = attempt = winner = tossWinner = flipper = coinFace = picker = pickedFace = "";
+        tossReveal.stop();
+        flipping = false;
+        flipStarted = celebrationStarted = resultStarted = 0;
+        target = 0;
+        releaseAngle = 0;
         ready = ended = false;
         scores.clear();
         scope.clear();
@@ -241,6 +351,27 @@ public final class Desktop {
         Arrays.fill(seats, "");
         Arrays.fill(names, "");
         clearRound();
+        noticeExpiry.stop();
+        clearNotice();
+        refresh();
+    }
+
+    private void notifyPlayer(String message) {
+        notice.setText(message);
+        notice.started = System.nanoTime();
+        noticeExpiry.restart();
+    }
+
+    private void clearNotice() {
+        notice.setText(" ");
+        notice.started = 0;
+    }
+
+    private void revealToss() {
+        flipping = false;
+        pending = false;
+        sampleStatus.setText(coinFace.equals("HEADS") ? "Heads landed" : "Tails landed");
+        if (me.equals(tossWinner)) celebrationStarted = System.nanoTime();
         refresh();
     }
 
@@ -251,6 +382,7 @@ public final class Desktop {
                     me = message[1];
                     round = message[2];
                     pending = false;
+                    notifyPlayer("Connected to the room");
                 }
                 case "PLAYERS" -> {
                     seats[0] = message[1]; names[0] = message[2];
@@ -258,25 +390,65 @@ public final class Desktop {
                     admin = seats[0];
                 }
                 case "ADMIN" -> admin = message[1];
-                case "WAITING", "READY" -> {
+                case "WAITING" -> {
                     round = message[1];
-                    ready = message[0].equals("READY");
+                    clearRound();
+                    pending = false;
+                    notifyPlayer("Connected · Waiting for another player");
+                }
+                case "TOSS_READY" -> {
+                    round = message[1];
+                    flipper = message[2];
+                    pickedFace = message[3];
+                    pending = false;
+                    sampleStatus.setText("Coin toss");
+                }
+                case "TOSS_PICK" -> {
+                    round = message[1];
+                    picker = message[2];
+                    pending = false;
+                    sampleStatus.setText("Coin toss");
+                    notifyPlayer("Both players connected");
+                }
+                case "TOSS" -> {
+                    round = message[1];
+                    tossWinner = message[2];
+                    coinFace = message[3];
                     owner = "";
+                    ready = false;
+                    flipping = true;
+                    flipStarted = System.nanoTime();
+                    sampleStatus.setText("Coin in the air");
+                    tossReveal.restart();
+                }
+                case "TARGET" -> {
+                    target = Double.parseDouble(message[2]);
+                    pending = false;
+                    sampleStatus.setText("Waiting for a swing");
+                    notifyPlayer(String.format(Locale.ROOT, "Target locked · %.2f s", target));
                 }
                 case "TURN" -> {
                     owner = message[2];
+                    ready = true;
                     pending = false;
                     feedback.setText(" ");
+                    if (me.equals(owner)) {
+                        scope.clear();
+                        scope.previewLength = length.getValue() / 100.0;
+                        sampleStatus.setText("Ready to pull");
+                        notifyPlayer("Your turn · Pull and release the weight");
+                    }
                 }
                 case "START" -> {
                     round = message[1];
                     attempt = message[2];
                     owner = message[3];
-                    sequence = -1;
-                    gaps = 0;
                     pending = false;
                     scope.clear();
-                    scope.period = Game.period(Double.parseDouble(message[4]));
+                    scope.previewLength = Double.parseDouble(message[4]);
+                    releaseAngle = Double.parseDouble(message[5]);
+                    scope.period = Game.period(scope.previewLength, releaseAngle);
+                    scope.trace.start(scope.period, releaseAngle);
                     sampleStatus.setText("Receiving live samples");
                 }
                 case "SAMPLE" -> {
@@ -284,12 +456,9 @@ public final class Desktop {
                     long next = Long.parseLong(message[3]);
                     long elapsed = Long.parseLong(message[4]);
                     double angle = Double.parseDouble(message[5]);
-                    if (next <= sequence || elapsed < 0 || elapsed > 4000 ||
-                            !Double.isFinite(angle) || Math.abs(angle) > Game.AMPLITUDE) return;
-                    if (sequence >= 0) gaps += next - sequence - 1;
-                    sequence = next;
-                    scope.sample(elapsed / 1000.0, angle);
-                    sampleStatus.setText("UDP  ·  " + (sequence + 1) + " samples" +
+                    if (!scope.trace.accept(next, elapsed, angle, System.nanoTime())) return;
+                    long gaps = scope.trace.missing();
+                    sampleStatus.setText("UDP  ·  " + scope.trace.received() + " samples" +
                             (gaps == 0 ? "" : "  ·  " + gaps + " missed"));
                     return;
                 }
@@ -297,14 +466,19 @@ public final class Desktop {
                     double period = Double.parseDouble(message[4]);
                     scores.put(message[3], period);
                     attempt = owner = "";
-                    scope.sample(period, Game.AMPLITUDE);
-                    sampleStatus.setText(sequence < 0 ? "Swing complete · no UDP samples" :
-                            gaps == 0 ? "Swing complete" : "Swing complete · " + gaps + " UDP missed");
+                    scope.trace.finish();
+                    sampleStatus.setText(scope.trace.received() == 0 ? "Swing complete · no UDP samples" :
+                            scope.trace.missing() == 0 ? "Swing complete" :
+                                    "Swing complete · " + scope.trace.missing() + " UDP missed");
                 }
                 case "RESULT" -> {
                     winner = message[2];
                     ended = true;
                     ready = false;
+                    resultStarted = System.nanoTime();
+                    if (me.equals(winner)) celebrationStarted = System.nanoTime();
+                    notifyPlayer(winner.equals("TIE") ? "Round complete · Draw" :
+                            "Round complete · " + playerName(winner) + " wins");
                 }
                 case "ABORT" -> {
                     ready = false;
@@ -342,25 +516,42 @@ public final class Desktop {
         return switch (code) {
             case "BAD_JOIN" -> "The host rejected the player details.";
             case "ROOM_UNAVAILABLE" -> "The room is full or awaiting a reset.";
-            case "TURN_TAKEN" -> "The other player claimed the turn.";
             case "INVALID_LENGTH" -> "Enter a length from 0.25 to 2.00 metres.";
+            case "INVALID_ANGLE" -> "Pull the weight at least 5° from centre before releasing.";
+            case "INVALID_TARGET" -> "Choose a time from 1.20 to 2.90 seconds.";
+            case "NOT_FLIPPER" -> "The other player flips the coin after your choice.";
+            case "NOT_PICKER" -> "The first player chooses Heads or Tails.";
+            case "TOSS_UNAVAILABLE" -> "This round already has a coin result or needs another player.";
             case "NOT_OWNER" -> "Only the turn owner can control this swing.";
             default -> "The host rejected that action (" + code + ").";
         };
     }
 
-    private void play() {
-        if (!me.equals(owner)) {
-            command("CLAIM");
+    private void setTarget() {
+        try {
+            String entered = targetField.getText().strip();
+            if (!entered.matches("[0-9]+(\\.[0-9]{1,2})?")) throw new NumberFormatException();
+            double value = Double.parseDouble(entered);
+            if (value < Game.MIN_TARGET || value > Game.MAX_TARGET) throw new NumberFormatException();
+            command("TARGET|" + entered);
+        } catch (NumberFormatException exception) {
+            feedback.setText("Choose a time from 1.20 to 2.90 seconds, using up to two decimal places.");
+        }
+    }
+
+    private boolean canPull() {
+        return ready && !me.isEmpty() && me.equals(owner) && attempt.isEmpty() && !pending && !ended;
+    }
+
+    private void release(double angle) {
+        if (!canPull()) return;
+        if (!Game.validAngle(angle)) {
+            scope.pullAngle = 0;
+            feedback.setText("Pull the weight at least 5° from centre before releasing.");
+            scope.repaint();
             return;
         }
-        try {
-            double value = Double.parseDouble(length.getText().strip());
-            if (!Game.validLength(value)) throw new NumberFormatException();
-            command("PLAY|" + java.math.BigDecimal.valueOf(value).toPlainString());
-        } catch (NumberFormatException exception) {
-            feedback.setText("Enter a length from 0.25 to 2.00 metres.");
-        }
+        command(String.format(Locale.ROOT, "PLAY|%.2f|%.2f", length.getValue() / 100.0, angle));
     }
 
     private void command(String command) {
@@ -395,38 +586,67 @@ public final class Desktop {
         name.setEnabled(!connected && !pending);
         host.setEnabled(!connected && !pending);
         port.setEnabled(!connected && !pending);
-        length.setEnabled(turn && attempt.isEmpty() && !pending);
-        action.setText(turn ? "Start swing" : "Claim turn");
-        action.setEnabled(joined && ready && !ended && attempt.isEmpty() && !pending &&
-                (turn || (owner.isEmpty() && !scores.containsKey(me))));
+        boolean canPick = joined && me.equals(picker) && pickedFace.isEmpty();
+        faceControls.setVisible(canPick);
+        heads.setEnabled(canPick && !pending);
+        tails.setEnabled(canPick && !pending);
+        boolean canFlip = joined && !flipper.isEmpty() && me.equals(flipper) && tossWinner.isEmpty();
+        flip.setVisible(canFlip);
+        flip.setEnabled(canFlip && !pending);
+        boolean pickingTarget = joined && target == 0 && me.equals(tossWinner) && !flipping && !ended;
+        targetControls.setVisible(pickingTarget);
+        targetField.setEnabled(pickingTarget && !pending);
+        action.setEnabled(pickingTarget && !pending);
+        lengthControls.setVisible(target > 0 && !ended);
+        length.setEnabled(canPull());
+        tossReadout.setText(tossWinner.isEmpty() || flipping ? " " :
+                (tossWinner.equals(me) ? "You won the toss" : playerName(tossWinner) + " won the toss"));
+        targetReadout.setText(target == 0 ? "Target period  —" : String.format(Locale.ROOT, "Target period  %.2f s", target));
         reset.setVisible(joined && ended && me.equals(admin));
         reset.setEnabled(!pending);
         if (!joined) {
             headline.setText("Connect to a room");
             details.setText("Enter your name and host address.");
         } else if (ended) {
-            headline.setText(winner.isEmpty() ? "Round stopped" : "Round complete");
+            headline.setText(winner.isEmpty() ? "Round stopped" : me.equals(winner) ? "You won!" : "Round complete");
             details.setText(winner.isEmpty() ? "A player disconnected." :
                     winner.equals("TIE") ? "Both attempts tied." :
-                            winner.equals(me) ? "You won this round." : playerName(winner) + " won.");
+                            winner.equals(me) ? "Your swing was closest to the target." : playerName(winner) + " won.");
+        } else if (flipping) {
+            headline.setText("Flipping the coin…");
+            details.setText("The result will appear on both screens.");
+        } else if (!picker.isEmpty() && pickedFace.isEmpty()) {
+            headline.setText(canPick ? "Choose Heads or Tails" : "Waiting for coin choice");
+            details.setText(canPick ? playerName(seats[1]) + " will flip after you choose." :
+                    playerName(picker) + " is choosing a side. You flip next.");
+        } else if (!flipper.isEmpty() && tossWinner.isEmpty()) {
+            headline.setText(canFlip ? "Flip the coin" : "Waiting for the flip");
+            String selection = pickedFace.equals("HEADS") ? "Heads" : "Tails";
+            String other = pickedFace.equals("HEADS") ? "Tails" : "Heads";
+            details.setText(canFlip ? playerName(picker) + " chose " + selection + ". You’re " + other + "." :
+                    "You chose " + selection + ". " + playerName(flipper) + " flips now.");
+        } else if (!tossWinner.isEmpty() && target == 0) {
+            headline.setText(pickingTarget ? "You won the toss!" : "Selecting target time");
+            details.setText(pickingTarget ? "Set the goal for both players." :
+                    playerName(tossWinner) + " is selecting the target time.");
         } else if (!attempt.isEmpty()) {
             headline.setText("Swing in progress");
             details.setText(turn ? "Your attempt is live." : "Watching " + playerName(owner) + ".");
         } else if (turn) {
             headline.setText("Your turn");
-            details.setText("Choose a length from 0.25–2.00 m.");
+            details.setText("Set the length, then drag the weight sideways and release.");
         } else if (!owner.isEmpty()) {
             headline.setText("Other player’s turn");
-            details.setText(playerName(owner) + " is choosing a length.");
+            details.setText("Watching " + playerName(owner) + " set up the swing.");
         } else if (!ready) {
-            headline.setText("Waiting for a player");
-            details.setText("Share the host address and port.");
+            headline.setText("Waiting for someone");
+            details.setText("You’re connected. Share the host address and port.");
         } else if (scores.containsKey(me)) {
             headline.setText("Attempt recorded");
             details.setText("Waiting for the other attempt.");
         } else {
             headline.setText("Round ready");
-            details.setText("Claim the turn to choose a length.");
+            details.setText("The host is assigning the next turn.");
         }
         for (int i = 0; i < 2; i++) {
             players[i].setText(seats[i].isEmpty() ? "Waiting for player" :
@@ -434,7 +654,7 @@ public final class Desktop {
             players[i].setToolTipText(names[i]);
             Double period = scores.get(seats[i]);
             times[i].setText(period == null ? "—" : String.format(Locale.ROOT, "%.2f s", period));
-            errors[i].setText(period == null ? " " : String.format(Locale.ROOT, "Off target by %.3f s", Game.error(period)));
+            errors[i].setText(period == null ? " " : String.format(Locale.ROOT, "Off target by %.3f s", Game.error(period, target)));
         }
     }
 
@@ -451,11 +671,60 @@ public final class Desktop {
     }
 
     private static JPanel surface(LayoutManager manager) {
-        JPanel panel = new JPanel(manager);
-        panel.setBackground(WHITE);
-        panel.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(LINE),
-                new EmptyBorder(15, 16, 15, 16)));
+        JPanel panel = new JPanel(manager) {
+            @Override protected void paintComponent(Graphics graphics) {
+                Graphics2D g = (Graphics2D) graphics.create();
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                double width = getWidth() - 2.0;
+                double height = getHeight() - 5.0;
+                g.setColor(new Color(0, 5, 19, 62));
+                g.fill(new RoundRectangle2D.Double(1, 4, width, height, 24, 24));
+                Shape glass = new RoundRectangle2D.Double(1, 1, width, height, 23, 23);
+                g.setPaint(new GradientPaint(0, 0, new Color(131, 170, 235, 42),
+                        getWidth() * .7f, getHeight(), new Color(17, 28, 60, 117)));
+                g.fill(glass);
+                g.setPaint(new GradientPaint(0, 0, new Color(214, 238, 255, 97), 0, getHeight(), LINE));
+                g.draw(glass);
+                g.dispose();
+            }
+        };
+        panel.setOpaque(false);
+        panel.setBorder(new EmptyBorder(17, 17, 19, 17));
         return panel;
+    }
+
+    private static void glow(Graphics2D g, float x, float y, float radius, Color tint) {
+        g.setPaint(new RadialGradientPaint(x, y, radius, new float[]{0, 1},
+                new Color[]{tint, new Color(tint.getRed(), tint.getGreen(), tint.getBlue(), 0)}));
+        g.fill(new Ellipse2D.Float(x - radius, y - radius, radius * 2, radius * 2));
+    }
+
+    private static final class Toast extends JLabel {
+        long started;
+
+        Toast() {
+            super(" ");
+            setFont(BODY.deriveFont(Font.BOLD, 13f));
+            setForeground(GREEN);
+            setBorder(new EmptyBorder(7, 13, 7, 13));
+        }
+
+        @Override protected void paintComponent(Graphics graphics) {
+            if (started == 0) return;
+            double ms = (System.nanoTime() - started) / 1_000_000.0;
+            double opacity = Math.max(0, Math.min(1, Math.min(ms / 240, (4200 - ms) / 550)));
+            Graphics2D g = (Graphics2D) graphics.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setComposite(AlphaComposite.SrcOver.derive((float) opacity));
+            g.translate((1 - opacity) * 10, 0);
+            Shape pill = new RoundRectangle2D.Double(1, 1, getWidth() - 2.0, getHeight() - 2.0, 16, 16);
+            g.setColor(new Color(35, 78, 96, 221));
+            g.fill(pill);
+            g.setColor(new Color(117, 235, 212, 100));
+            g.draw(pill);
+            super.paintComponent(g);
+            g.dispose();
+        }
     }
 
     private static JLabel label(String text, int size, boolean bold, Color color) {
@@ -492,6 +761,8 @@ public final class Desktop {
         JTextField field = new JTextField(text, columns);
         field.setFont(BODY);
         field.setForeground(INK);
+        field.setDisabledTextColor(MUTED);
+        field.setCaretColor(GREEN);
         field.setBackground(WHITE);
         field.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(LINE),
                 new EmptyBorder(7, 8, 7, 8)));
@@ -503,15 +774,16 @@ public final class Desktop {
             @Override protected void paintComponent(Graphics graphics) {
                 Graphics2D g = (Graphics2D) graphics.create();
                 g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g.setColor(!isEnabled() ? SOFT : getModel().isPressed() ? GREEN.darker() :
-                        getModel().isRollover() ? new Color(36, 97, 75) : GREEN);
-                g.fillRoundRect(0, 0, getWidth(), getHeight(), 9, 9);
+                Color highlight = getModel().isRollover() ? new Color(159, 255, 229) : new Color(122, 237, 216);
+                Color base = getModel().isPressed() ? new Color(57, 137, 152) : new Color(59, 183, 188);
+                g.setPaint(isEnabled() ? new GradientPaint(0, 0, highlight, 0, getHeight(), base) : SOFT);
+                g.fillRoundRect(0, 0, getWidth(), getHeight(), 13, 13);
                 if (isFocusOwner()) {
-                    g.setColor(isEnabled() ? WHITE : GREEN);
+                    g.setColor(isEnabled() ? PAPER : GREEN);
                     g.drawRoundRect(2, 2, getWidth() - 5, getHeight() - 5, 7, 7);
                 }
                 g.setFont(getFont());
-                g.setColor(isEnabled() ? WHITE : MUTED);
+                g.setColor(isEnabled() ? PAPER : MUTED);
                 FontMetrics metrics = g.getFontMetrics();
                 g.drawString(getText(), (getWidth() - metrics.stringWidth(getText())) / 2,
                         (getHeight() - metrics.getHeight()) / 2 + metrics.getAscent());
@@ -529,36 +801,107 @@ public final class Desktop {
         return button;
     }
 
-    private static final class Scope extends JComponent {
-        private record Sample(double seconds, double angle) {}
-        private final List<Sample> samples = new ArrayList<>();
-        private final javax.swing.Timer timer = new javax.swing.Timer(16, event -> repaint());
-        private double from = Game.AMPLITUDE;
-        private double to = Game.AMPLITUDE;
+    private final class Scope extends JComponent {
+        private static final double YAW = Math.toRadians(15);
+        private final SwingTrace trace = new SwingTrace();
+        private final javax.swing.Timer timer = new javax.swing.Timer(16, event -> {
+            repaint();
+            if (notice.started != 0) notice.repaint();
+        });
         private double period = Game.TARGET;
-        private long changed;
+        private double previewLength = .95;
+        private double pullAngle;
+        private boolean dragging;
 
         Scope() {
+            MouseAdapter pull = new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent event) {
+                    if (!SwingUtilities.isLeftMouseButton(event) || !canPull()) return;
+                    Point2D bob = bobPosition(pullAngle);
+                    if (bob.distance(event.getPoint()) > 29) return;
+                    dragging = true;
+                    setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
+                    feedback.setText(" ");
+                }
+
+                @Override public void mouseDragged(MouseEvent event) {
+                    if (!dragging) return;
+                    updatePull(event);
+                }
+
+                @Override public void mouseMoved(MouseEvent event) {
+                    boolean onWeight = canPull() && bobPosition(pullAngle).distance(event.getPoint()) <= 29;
+                    setCursor(onWeight ? Cursor.getPredefinedCursor(Cursor.HAND_CURSOR) : Cursor.getDefaultCursor());
+                }
+
+                @Override public void mouseReleased(MouseEvent event) {
+                    if (!dragging) return;
+                    updatePull(event);
+                    dragging = false;
+                    setCursor(Cursor.getDefaultCursor());
+                    release(pullAngle);
+                }
+            };
+            addMouseListener(pull);
+            addMouseMotionListener(pull);
+            setFocusable(true);
+            setToolTipText("Drag the weight sideways and release. Keyboard: arrows to pull, Space to release.");
+            bindPullKey("LEFT", -5);
+            bindPullKey("RIGHT", 5);
+            getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke("SPACE"), "release");
+            getActionMap().put("release", new AbstractAction() {
+                @Override public void actionPerformed(java.awt.event.ActionEvent event) {
+                    release(pullAngle);
+                }
+            });
             timer.start();
         }
 
-        void clear() {
-            samples.clear();
-            from = to = Game.AMPLITUDE;
-            period = Game.TARGET;
+        private void bindPullKey(String key, double degrees) {
+            getInputMap(WHEN_FOCUSED).put(KeyStroke.getKeyStroke(key), key);
+            getActionMap().put(key, new AbstractAction() {
+                @Override public void actionPerformed(java.awt.event.ActionEvent event) {
+                    if (canPull()) pullAngle = limitAngle(pullAngle + degrees);
+                }
+            });
+        }
+
+        private void updatePull(MouseEvent event) {
+            pullAngle = limitAngle(Math.toDegrees(Math.atan2((event.getX() - getWidth() / 2.0) / Math.cos(YAW),
+                    Math.max(1, event.getY() - pivot()))));
             repaint();
         }
 
-        void sample(double seconds, double angle) {
-            from = angleNow();
-            to = angle;
-            changed = System.nanoTime();
-            samples.add(new Sample(seconds, angle));
+        private double limitAngle(double degrees) {
+            return Math.max(-Game.MAX_ANGLE, Math.min(Game.MAX_ANGLE, degrees));
         }
 
-        private double angleNow() {
-            double fraction = Math.min(1, Math.max(0, (System.nanoTime() - changed) / 50_000_000.0));
-            return from + (to - from) * fraction;
+        private double pivot() {
+            return 64;
+        }
+
+        private double arm() {
+            double max = Math.min(getWidth() * .45, getHeight() * .50);
+            return Math.max(50, max * (.52 + .48 * (previewLength - Game.MIN_LENGTH) /
+                    (Game.MAX_LENGTH - Game.MIN_LENGTH)));
+        }
+
+        private Point2D bobPosition(double degrees) {
+            double radians = Math.toRadians(degrees);
+            double lateral = arm() * Math.sin(radians);
+            double depth = lateral * Math.sin(YAW);
+            double perspective = 550 / (550 - depth);
+            return new Point2D.Double(getWidth() / 2.0 + lateral * Math.cos(YAW) * perspective,
+                    pivot() + arm() * Math.cos(radians) * perspective);
+        }
+
+        void clear() {
+            trace.clear();
+            pullAngle = 0;
+            dragging = false;
+            setCursor(Cursor.getDefaultCursor());
+            period = Game.TARGET;
+            repaint();
         }
 
         @Override
@@ -568,34 +911,68 @@ public final class Desktop {
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             int width = getWidth();
             int height = getHeight();
+            if (!picker.isEmpty() && target == 0 && !ended) {
+                paintToss(g, width, height);
+                g.dispose();
+                return;
+            }
             double center = width / 2.0;
-            double pivot = 53;
-            double arm = Math.max(60, Math.min(width * .45, height * .49));
-            g.setColor(SOFT);
-            g.fill(new Ellipse2D.Double(center - arm / 2, pivot + arm * .53, arm, arm * .68));
+            double pivot = pivot();
+            double arm = arm();
+            double floor = pivot + arm + 27;
+            double floorWidth = Math.max(145, arm * 1.35);
+            glow(g, (float) center, (float) (floor - 60), (float) Math.max(90, arm * 1.05),
+                    new Color(60, 192, 212, 33));
+            for (int ring = 1; ring <= 3; ring++) {
+                double radius = floorWidth * ring / 3;
+                g.setColor(new Color(111, 208, 227, 19 + ring * 5));
+                g.draw(new Ellipse2D.Double(center - radius, floor - radius * .18, radius * 2, radius * .36));
+            }
             g.setColor(LINE);
             g.draw(new Line2D.Double(center, pivot, center, pivot + arm + 32));
-            double angle = Math.toRadians(angleNow());
-            double bobX = center + arm * Math.sin(angle);
-            double bobY = pivot + arm * Math.cos(angle);
-            g.setColor(GREEN);
-            g.setStroke(new BasicStroke(2.4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            Point2D bob = bobPosition(canPull() || (pending && attempt.isEmpty() && ready) ? pullAngle :
+                    trace.angleAt(System.nanoTime()));
+            double bobX = bob.getX();
+            double bobY = bob.getY();
+            g.setPaint(new LinearGradientPaint((float) center, (float) pivot, (float) bobX, (float) bobY,
+                    new float[]{0, 1}, new Color[]{new Color(170, 195, 222), GREEN}));
+            g.setStroke(new BasicStroke(2.7f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
             g.draw(new Line2D.Double(center, pivot, bobX, bobY));
+            double lift = Math.max(0, pivot + arm - bobY);
+            double shadowWidth = 48 + lift * .24;
+            g.setColor(new Color(0, 5, 16, (int) Math.max(25, 116 - lift)));
+            g.fill(new Ellipse2D.Double(bobX - shadowWidth / 2, floor - 5, shadowWidth, 10 + lift * .04));
+            glow(g, (float) bobX, (float) bobY, 33, new Color(70, 225, 210, 64));
+            g.setPaint(new RadialGradientPaint((float) bobX - 7, (float) bobY - 8, 29,
+                    new float[]{0, .38f, .73f, 1},
+                    new Color[]{new Color(228, 255, 248), GREEN, new Color(26, 141, 157), new Color(11, 50, 90)}));
+            g.fill(new Ellipse2D.Double(bobX - 17, bobY - 17, 34, 34));
+            g.setColor(new Color(191, 254, 246, 168));
+            g.setStroke(new BasicStroke(1));
+            g.draw(new Ellipse2D.Double(bobX - 17, bobY - 17, 34, 34));
+            g.setColor(GREEN);
             g.fill(new Ellipse2D.Double(center - 5, pivot - 5, 10, 10));
-            g.fill(new Ellipse2D.Double(bobX - 14, bobY - 14, 28, 28));
+            if (canPull()) {
+                g.setFont(BODY.deriveFont(13f));
+                g.setColor(MUTED);
+                String instruction = Math.abs(pullAngle) < .01 ? "Drag the weight to release" :
+                        String.format(Locale.ROOT, "%.0f° release angle", Math.abs(pullAngle));
+                g.drawString(instruction, (float) (center - g.getFontMetrics().stringWidth(instruction) / 2.0),
+                        (float) Math.min(floor + 34, height * .66 - 12));
+            }
 
             double left = 34;
             double right = width - 14;
             double top = height * .69;
             double bottom = height - 30;
             double middle = (top + bottom) / 2;
-            double scale = Math.max(1, (bottom - top - 14) / 24);
+            double scale = Math.max(.3, (bottom - top - 14) / (2 * (Math.abs(releaseAngle) + 8)));
             g.setFont(BODY.deriveFont(11f));
             g.setColor(MUTED);
             g.drawString("Angle (°)", 0, (int) top - 11);
             g.drawString("0", 14, (int) middle + 4);
             g.drawString("0 s", (int) left, height - 9);
-            String end = String.format(Locale.ROOT, "%.2f s", period);
+            String end = trace.points().isEmpty() ? "" : String.format(Locale.ROOT, "%.2f s", period);
             g.drawString(end, (int) right - g.getFontMetrics().stringWidth(end), height - 9);
             g.setColor(LINE);
             g.setStroke(new BasicStroke(1));
@@ -604,17 +981,115 @@ public final class Desktop {
                 g.draw(new Line2D.Double(x, top, x, bottom));
             }
             g.draw(new Line2D.Double(left, middle, right, middle));
-            Path2D trace = new Path2D.Double();
-            for (Sample sample : samples) {
-                double x = left + (right - left) * Math.min(1, sample.seconds / period);
-                double y = middle - sample.angle * scale;
-                if (trace.getCurrentPoint() == null) trace.moveTo(x, y);
-                else trace.lineTo(x, y);
+            Path2D chart = new Path2D.Double();
+            double previousTime = -1;
+            for (SwingTrace.Sample sample : trace.points()) {
+                double x = left + (right - left) * Math.min(1, sample.seconds() / period);
+                double y = middle - sample.angle() * scale;
+                if (previousTime < 0 || sample.seconds() - previousTime > SwingTrace.PLOT_GAP) chart.moveTo(x, y);
+                else chart.lineTo(x, y);
+                previousTime = sample.seconds();
             }
             g.setColor(GREEN);
+            g.setStroke(new BasicStroke(7, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g.setColor(new Color(117, 235, 212, 29));
+            g.draw(chart);
+            g.setColor(GREEN);
             g.setStroke(new BasicStroke(2, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-            g.draw(trace);
+            g.draw(chart);
+            if (ended && me.equals(winner)) paintConfetti(g, width, height * .58);
+            if (resultStarted != 0) paintResult(g, width);
             g.dispose();
+        }
+
+        private void paintResult(Graphics2D g, int width) {
+            double alpha = Math.min(1, (System.nanoTime() - resultStarted) / 380_000_000.0);
+            Graphics2D banner = (Graphics2D) g.create();
+            banner.setComposite(AlphaComposite.SrcOver.derive((float) alpha));
+            double panelWidth = Math.min(310, width - 24);
+            double left = (width - panelWidth) / 2;
+            double y = 7 - (1 - alpha) * 12;
+            Shape panel = new RoundRectangle2D.Double(left, y, panelWidth, 39, 15, 15);
+            banner.setPaint(new GradientPaint(0, (float) y, new Color(36, 85, 111), 0, (float) y + 39,
+                    new Color(26, 48, 77)));
+            banner.fill(panel);
+            banner.setColor(new Color(117, 235, 212, 124));
+            banner.draw(panel);
+            String title = winner.equals("TIE") ? "It’s a tie" : winner.equals(me) ?
+                    "Congratulations, you won!" : playerName(winner) + " wins";
+            centered(banner, title, width / 2.0, y + 25, 16, true, INK);
+            banner.dispose();
+        }
+
+        private void paintToss(Graphics2D g, int width, int height) {
+            double progress = flipping ? Math.min(1, (System.nanoTime() - flipStarted) / 1_350_000_000.0) : 0;
+            double x = width / 2.0;
+            double restingY = height * .40;
+            double flight = Math.min(1, progress / .83);
+            double hop = progress < .83 ? 4 * flight * (1 - flight) : .12 * Math.sin(Math.PI * (progress - .83) / .17);
+            double y = restingY - (flipping ? hop * Math.min(89, height * .18) : 0);
+            double rotation = (coinFace.equals("TAILS") ? 7 : 6) * Math.PI * (1 - Math.pow(1 - flight, 1.65));
+            double facing = Math.cos(rotation);
+            double stretch = flipping ? Math.max(.035, Math.abs(facing)) : 1;
+            boolean landed = !coinFace.isEmpty() && !flipping;
+            glow(g, (float) x, (float) y, (float) Math.min(185, height * .37), new Color(228, 160, 77, 62));
+            g.setColor(SOFT);
+            double shadow = 96 - 35 * hop;
+            g.fill(new Ellipse2D.Double(x - shadow / 2, restingY + 68, shadow, 14));
+            Graphics2D coin = (Graphics2D) g.create();
+            coin.translate(x, y);
+            coin.rotate(flipping ? Math.sin(flight * Math.PI) * .18 : 0);
+            double rim = 6 + (1 - stretch) * 12;
+            coin.setColor(GOLD_EDGE.darker());
+            coin.fill(new Ellipse2D.Double(-55 * stretch - rim / 2, -53, 110 * stretch + rim, 110));
+            coin.scale(stretch, 1);
+            coin.setColor(GOLD_EDGE);
+            coin.fill(new Ellipse2D.Double(-57, -54, 114, 114));
+            coin.setPaint(new GradientPaint(-46, -50, new Color(255, 219, 151), 52, 58, GOLD));
+            coin.fill(new Ellipse2D.Double(-55, -56, 110, 110));
+            coin.setColor(GOLD_EDGE);
+            coin.setStroke(new BasicStroke(2));
+            coin.draw(new Ellipse2D.Double(-45, -46, 90, 90));
+            String face = landed ? coinFace.substring(0, 1) :
+                    flipping ? (facing >= 0 ? "H" : "T") : "H / T";
+            if (stretch > .14) centered(coin, face, 0, landed || flipping ? 13 : 7, landed || flipping ? 39 : 22, true, GOLD_EDGE);
+            coin.dispose();
+            String heading = landed ? (me.equals(tossWinner) ? "Congratulations!" : playerName(tossWinner) + " won the toss") :
+                    flipping ? "Coin in the air" : "Heads or tails?";
+            String subtitle = landed ? (coinFace.equals("HEADS") ? "Heads" : "Tails") + " landed" : " ";
+            double textY = Math.max(restingY + 115, height * .67);
+            centered(g, heading, x, textY, 29, true, INK);
+            if (landed) {
+                centered(g, subtitle, x, textY + 28, 15, false, MUTED);
+                if (me.equals(tossWinner)) paintConfetti(g, width, height * .66);
+            }
+        }
+
+        private void centered(Graphics2D g, String text, double x, double baseline, int size, boolean bold, Color color) {
+            g.setFont(BODY.deriveFont(bold ? Font.BOLD : Font.PLAIN, size));
+            g.setColor(color);
+            g.drawString(text, (float) (x - g.getFontMetrics().stringWidth(text) / 2.0), (float) baseline);
+        }
+
+        private void paintConfetti(Graphics2D g, int width, double area) {
+            if (celebrationStarted == 0) return;
+            double elapsed = (System.nanoTime() - celebrationStarted) / 1_000_000_000.0;
+            if (elapsed > 2.9) return;
+            Color[] colors = {new Color(167, 148, 246), GOLD, GREEN, new Color(250, 151, 165)};
+            for (int i = 0; i < 36; i++) {
+                double time = elapsed - (i % 9) * .075;
+                if (time < 0) continue;
+                double x = width * (i % 2 == 0 ? .17 : .83) + ((i * 37) % 101 - 50) * time;
+                double y = area * .56 - (65 + (i * 19) % 89) * time + 92 * time * time;
+                if (y < 0 || y > area) continue;
+                Graphics2D piece = (Graphics2D) g.create();
+                piece.translate(x, y);
+                piece.rotate(time * ((i % 5) - 2));
+                piece.setComposite(AlphaComposite.SrcOver.derive((float) Math.min(1, (2.9 - elapsed) / .6)));
+                piece.setColor(colors[i % colors.length]);
+                piece.fillRoundRect(-3, -2, 7 + i % 3, 5, 2, 2);
+                piece.dispose();
+            }
         }
     }
 
