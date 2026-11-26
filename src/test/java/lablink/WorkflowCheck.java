@@ -47,6 +47,7 @@ public final class WorkflowCheck {
         String address = args.length == 0 ? "127.0.0.1" : args[0];
         checkPhysics();
         checkPlayback();
+        checkDiscoveryParsing();
         var hostFailure = new CompletableFuture<Throwable>();
         Host host = new Host(address, 0, 7);
         Thread server = new Thread(() -> {
@@ -58,7 +59,9 @@ public final class WorkflowCheck {
         }, "Workflow host");
         server.start();
         try {
-            run(address, host.port());
+            int discoveryPort = host.discoveryPort();
+            check(discoveryPort > 0, "Discovery responder bound to UDP port");
+            run(address, host.port(), discoveryPort);
         } finally {
             host.close();
             server.join(5000);
@@ -66,7 +69,7 @@ public final class WorkflowCheck {
         check(!server.isAlive(), "Host must shut down");
         if (hostFailure.isDone()) throw new AssertionError("Host failed", hostFailure.join());
         System.out.println("PASS on " + address +
-                ": physics and playback; TCP framing; toss and target authorization; automatic turns; UDP loss; winner, tie, reset, and reconnect");
+                ": physics and playback; LAN UDP discovery; TCP framing; toss and target authorization; automatic turns; UDP loss; winner, tie, reset, and reconnect");
     }
 
     private static void checkPhysics() {
@@ -106,7 +109,47 @@ public final class WorkflowCheck {
         check(trace.angleAt(start + 2_100_000_000) == 50, "Finish at release angle");
     }
 
-    private static void run(String address, int port) throws Exception {
+    private static void checkDiscoveryParsing() {
+        var explicit = Discovery.parseReply(
+                "LABLINK_HOST|1|abc12345|srv01|192.168.1.20|5050|1|2|3|WAITING|Asha",
+                "127.0.0.1", "abc12345", 4);
+        check(explicit != null && "192.168.1.20".equals(explicit.address()) && explicit.port() == 5050
+                && explicit.players() == 1 && explicit.round() == 3 && explicit.joinable()
+                && "Asha".equals(explicit.hostName()), "Explicit discovery reply parses");
+
+        var resolved = Discovery.parseReply(
+                "LABLINK_HOST|1|abc12345|srv01||5050|0|2|1|OPEN|",
+                "192.168.1.44", "abc12345", 2);
+        check(resolved != null && "192.168.1.44".equals(resolved.address()) && resolved.joinable(),
+                "Wildcard reply resolves sender IP");
+
+        check(Discovery.parseReply("LABLINK_HOST|1|wrong|srv01|127.0.0.1|5050|0|2|1|OPEN|",
+                "127.0.0.1", "abc12345", 1) == null, "Mismatched nonce ignored");
+        check(Discovery.parseReply("LABLINK_HOST|2|abc12345|srv01|127.0.0.1|5050|0|2|1|OPEN|",
+                "127.0.0.1", "abc12345", 1) == null, "Unsupported version ignored");
+        check(Discovery.parseReply("LABLINK_HOST|1|abc12345|srv01|127.0.0.1|70000|0|2|1|OPEN|",
+                "127.0.0.1", "abc12345", 1) == null, "Out-of-range port ignored");
+        check(Discovery.parseReply("LABLINK_HOST|1|abc12345|srv01|127.0.0.1|5050|3|2|1|OPEN|",
+                "127.0.0.1", "abc12345", 1) == null, "Invalid occupancy ignored");
+        check(Discovery.parseReply("LABLINK_HOST|1|abc12345|srv01|127.0.0.1|5050|0|2|1|BOGUS|",
+                "127.0.0.1", "abc12345", 1) == null, "Unknown state ignored");
+        check(Discovery.parseReply("LABLINK_HOST|1|abc12345",
+                "127.0.0.1", "abc12345", 1) == null, "Truncated discovery reply ignored");
+    }
+
+    private static void run(String address, int port, int discoveryPort) throws Exception {
+        Discovery.DiscoveredRoom openRoom = Discovery.scan(discoveryPort, 700).stream()
+                .filter(room -> room.port() == port)
+                .findFirst()
+                .orElse(null);
+        check(openRoom != null && openRoom.players() == 0 && "OPEN".equals(openRoom.state()) && openRoom.joinable(),
+                "Discovery finds open host before players join");
+
+        try (DatagramSocket garbage = new DatagramSocket()) {
+            byte[] bad = "GARBAGE|123".getBytes(StandardCharsets.UTF_8);
+            garbage.send(new DatagramPacket(bad, bad.length, InetAddress.getByName(address), discoveryPort));
+        }
+
         try (Socket partial = new Socket(address, port);
              Player a = new Player(address, port, "Asha")) {
             partial.setSoTimeout(4000);
@@ -114,6 +157,13 @@ public final class WorkflowCheck {
             var reader = new BufferedReader(new InputStreamReader(partial.getInputStream(), StandardCharsets.UTF_8));
             output.write("PI".getBytes(StandardCharsets.UTF_8));
             String aId = a.await("PLAYERS")[1];
+            Discovery.DiscoveredRoom waitingRoom = Discovery.scan(discoveryPort, 700).stream()
+                    .filter(room -> room.port() == port)
+                    .findFirst()
+                    .orElse(null);
+            check(waitingRoom != null && waitingRoom.players() == 1 && "WAITING".equals(waitingRoom.state())
+                    && "Asha".equals(waitingRoom.hostName()) && waitingRoom.joinable(),
+                    "Discovery reports waiting player state");
             a.send("PING");
             a.await("PONG");
             output.write("NG\nPING\n".getBytes(StandardCharsets.UTF_8));
@@ -121,6 +171,12 @@ public final class WorkflowCheck {
 
             try (Player b = new Player(address, port, "Kavin")) {
                 String bId = b.await("JOINED")[1];
+                Discovery.DiscoveredRoom fullRoom = Discovery.scan(discoveryPort, 700).stream()
+                        .filter(room -> room.port() == port)
+                        .findFirst()
+                        .orElse(null);
+                check(fullRoom != null && fullRoom.players() == 2 && "IN_GAME".equals(fullRoom.state())
+                        && !fullRoom.joinable(), "Discovery marks full room as in progress");
                 String owner = toss(a, b);
                 Player first = owner.equals(aId) ? a : b;
                 Player second = first == a ? b : a;
