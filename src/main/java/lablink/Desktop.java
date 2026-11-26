@@ -26,9 +26,9 @@ public final class Desktop {
     private static final Font BODY = new Font("Segoe UI", Font.PLAIN, 14);
 
     private final JFrame window = new JFrame("LabLink");
-    private final JTextField host = field("127.0.0.1", 12);
+    private final JTextField host = field("127.0.0.1", 11);
     private final JTextField port = field("5050", 5);
-    private final JTextField name = field("", 11);
+    private final JTextField name = field("", 10);
     private final JTextField targetField = field("2.00", 5);
     private final JSlider length = new JSlider(25, 200, 95);
     private final JLabel lengthReadout = label("0.95 m", 15, true, GREEN);
@@ -43,6 +43,7 @@ public final class Desktop {
     private final JLabel[] players = {label("Waiting for player", 14, true, INK), label("Waiting for player", 14, true, INK)};
     private final JLabel[] times = {label("—", 19, true, GREEN), label("—", 19, true, GREEN)};
     private final JLabel[] errors = {label(" ", 12, false, MUTED), label(" ", 12, false, MUTED)};
+    private final JButton scan = button("Scan LAN");
     private final JButton connect = button("Connect");
     private final JButton heads = button("Heads");
     private final JButton tails = button("Tails");
@@ -109,6 +110,7 @@ public final class Desktop {
         window.setContentPane(layout());
         window.setSize(1080, 760);
         window.setLocationByPlatform(true);
+        scan.addActionListener(event -> openDiscoveryDialog());
         connect.addActionListener(event -> toggleConnection());
         name.addActionListener(event -> { if (connection == null && !pending) toggleConnection(); });
         targetField.addActionListener(event -> { if (action.isEnabled()) action.doClick(); });
@@ -155,7 +157,11 @@ public final class Desktop {
         JPanel connectWrap = stack();
         connectWrap.add(status);
         connectWrap.add(Box.createVerticalStrut(5));
-        connectWrap.add(connect);
+        JPanel connectButtons = transparent(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        connectButtons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        connectButtons.add(scan);
+        connectButtons.add(connect);
+        connectWrap.add(connectButtons);
         settings.add(connectWrap);
         top.add(settings, BorderLayout.EAST);
         root.add(top, BorderLayout.NORTH);
@@ -264,6 +270,204 @@ public final class Desktop {
         messages.add(notice, BorderLayout.EAST);
         root.add(messages, BorderLayout.SOUTH);
         return root;
+    }
+
+    private void openDiscoveryDialog() {
+        if (connection != null || pending) return;
+        JDialog dialog = new JDialog(window, "LAN Rooms", Dialog.ModalityType.APPLICATION_MODAL);
+        dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+        dialog.setSize(520, 380);
+        dialog.setMinimumSize(new Dimension(460, 320));
+        dialog.setLocationRelativeTo(window);
+
+        JPanel root = new JPanel(new BorderLayout(0, 12)) {
+            @Override protected void paintComponent(Graphics graphics) {
+                Graphics2D g = (Graphics2D) graphics.create();
+                g.setPaint(new GradientPaint(0, 0, new Color(26, 37, 78), getWidth(), getHeight(), PAPER));
+                g.fillRect(0, 0, getWidth(), getHeight());
+                g.dispose();
+            }
+        };
+        root.setBorder(new EmptyBorder(18, 20, 18, 20));
+
+        JPanel header = stack();
+        header.add(label("Discovered LAN rooms", 19, true, INK));
+        header.add(Box.createVerticalStrut(3));
+        header.add(label("UDP multicast " + Discovery.MULTICAST_GROUP + ":" + Discovery.DEFAULT_PORT
+                + " & subnet broadcast", 12, false, MUTED));
+        root.add(header, BorderLayout.NORTH);
+
+        JPanel listPanel = new ScrollableListPanel();
+        JScrollPane scroll = new JScrollPane(listPanel);
+        scroll.setOpaque(false);
+        scroll.getViewport().setOpaque(false);
+        scroll.setBorder(BorderFactory.createEmptyBorder());
+        scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        scroll.getVerticalScrollBar().setUnitIncrement(14);
+        JPanel listSurface = surface(new BorderLayout());
+        listSurface.add(scroll, BorderLayout.CENTER);
+        root.add(listSurface, BorderLayout.CENTER);
+
+        JLabel scanStatus = label("Scanning local network…", 13, false, MUTED);
+        JButton rescan = button("Rescan");
+        JButton close = button("Close");
+        JPanel footer = transparent(new BorderLayout(10, 0));
+        footer.add(scanStatus, BorderLayout.CENTER);
+        JPanel actions = transparent(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        actions.add(rescan);
+        actions.add(close);
+        footer.add(actions, BorderLayout.EAST);
+        root.add(footer, BorderLayout.SOUTH);
+
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke("ESCAPE"), "closeDialog");
+        root.getActionMap().put("closeDialog", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) {
+                dialog.dispose();
+            }
+        });
+
+        Runnable runScan = () -> {
+            rescan.setEnabled(false);
+            scanStatus.setForeground(MUTED);
+            scanStatus.setText("Scanning local network…");
+            listPanel.removeAll();
+            listPanel.add(label("Listening for LabLink hosts…", 13, false, MUTED));
+            listPanel.revalidate();
+            listPanel.repaint();
+            Thread scanThread = new Thread(() -> {
+                try {
+                    java.util.List<Discovery.DiscoveredRoom> rooms = Discovery.scan();
+                    SwingUtilities.invokeLater(() -> {
+                        if (!dialog.isDisplayable()) return;
+                        rescan.setEnabled(true);
+                        listPanel.removeAll();
+                        if (rooms.isEmpty()) {
+                            scanStatus.setForeground(MUTED);
+                            scanStatus.setText("No rooms found");
+                            listPanel.add(label("No LabLink hosts found on the local network.", 14, true, INK));
+                            listPanel.add(Box.createVerticalStrut(6));
+                            listPanel.add(label("Start a host or verify that local UDP traffic is allowed.",
+                                    13, false, MUTED));
+                        } else {
+                            scanStatus.setForeground(GREEN);
+                            scanStatus.setText("Found " + rooms.size() + (rooms.size() == 1 ? " room" : " rooms"));
+                            for (int i = 0; i < rooms.size(); i++) {
+                                if (i > 0) listPanel.add(Box.createVerticalStrut(8));
+                                listPanel.add(roomCard(rooms.get(i), dialog));
+                            }
+                        }
+                        listPanel.revalidate();
+                        listPanel.repaint();
+                    });
+                } catch (IOException exception) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (!dialog.isDisplayable()) return;
+                        rescan.setEnabled(true);
+                        scanStatus.setForeground(ERROR);
+                        scanStatus.setText("LAN scan failed");
+                        listPanel.removeAll();
+                        JTextArea errorText = description();
+                        errorText.setForeground(ERROR);
+                        errorText.setText("Could not probe the network: " + exception.getMessage());
+                        listPanel.add(errorText);
+                        listPanel.revalidate();
+                        listPanel.repaint();
+                    });
+                }
+            }, "LabLink LAN scan");
+            scanThread.setDaemon(true);
+            scanThread.start();
+        };
+
+        rescan.addActionListener(event -> runScan.run());
+        close.addActionListener(event -> dialog.dispose());
+        dialog.setContentPane(root);
+        runScan.run();
+        dialog.setVisible(true);
+    }
+
+    private static final class ScrollableListPanel extends JPanel implements Scrollable {
+        ScrollableListPanel() {
+            setOpaque(false);
+            setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+        }
+
+        @Override public Dimension getPreferredScrollableViewportSize() {
+            return getPreferredSize();
+        }
+
+        @Override public int getScrollableUnitIncrement(Rectangle visibleRect, int orientation, int direction) {
+            return 16;
+        }
+
+        @Override public int getScrollableBlockIncrement(Rectangle visibleRect, int orientation, int direction) {
+            return 64;
+        }
+
+        @Override public boolean getScrollableTracksViewportWidth() {
+            return true;
+        }
+
+        @Override public boolean getScrollableTracksViewportHeight() {
+            return false;
+        }
+    }
+
+    private JPanel roomCard(Discovery.DiscoveredRoom room, JDialog dialog) {
+        boolean joinable = room.joinable();
+        JPanel card = new JPanel(new BorderLayout(10, 0)) {
+            @Override protected void paintComponent(Graphics graphics) {
+                Graphics2D g = (Graphics2D) graphics.create();
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                Shape pill = new RoundRectangle2D.Double(1, 1, getWidth() - 2.0, getHeight() - 2.0, 14, 14);
+                g.setColor(WHITE);
+                g.fill(pill);
+                g.setColor(joinable ? new Color(117, 235, 212, 90) : LINE);
+                g.draw(pill);
+                g.dispose();
+            }
+        };
+        card.setOpaque(false);
+        card.setBorder(new EmptyBorder(10, 12, 10, 12));
+        card.setAlignmentX(Component.LEFT_ALIGNMENT);
+        card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 68));
+        if (joinable) card.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+
+        JPanel info = stack();
+        JPanel top = transparent(new BorderLayout(8, 0));
+        top.setAlignmentX(Component.LEFT_ALIGNMENT);
+        top.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
+        top.add(label(room.displayTitle(), 14, true, INK), BorderLayout.WEST);
+        top.add(label(room.statusLabel() + " · " + room.players() + "/" + room.maxPlayers(),
+                12, true, joinable ? GREEN : MUTED), BorderLayout.EAST);
+        info.add(top);
+        info.add(Box.createVerticalStrut(4));
+        JLabel meta = label(room.address() + ":" + room.port() + "  ·  Round " + room.round()
+                + "  ·  " + room.rttMs() + " ms", 12, false, MUTED);
+        meta.setAlignmentX(Component.LEFT_ALIGNMENT);
+        info.add(meta);
+        card.add(info, BorderLayout.CENTER);
+
+        JButton select = button(joinable ? "Select" : "IN_GAME".equals(room.state()) ? "Full" : "Busy");
+        select.setEnabled(joinable);
+        card.add(select, BorderLayout.EAST);
+        if (joinable) {
+            Runnable pickRoom = () -> {
+                host.setText(room.address());
+                port.setText(Integer.toString(room.port()));
+                feedback.setText(" ");
+                notifyPlayer("Selected " + room.address() + ":" + room.port() + " · Click Connect");
+                dialog.dispose();
+            };
+            select.addActionListener(event -> pickRoom.run());
+            card.addMouseListener(new MouseAdapter() {
+                @Override public void mouseClicked(MouseEvent event) {
+                    pickRoom.run();
+                }
+            });
+        }
+        return card;
     }
 
     private void toggleConnection() {
@@ -583,6 +787,7 @@ public final class Desktop {
         status.setForeground(joined ? GREEN : MUTED);
         connect.setText(connected ? "Disconnect" : "Connect");
         connect.setEnabled(connected || !pending);
+        scan.setEnabled(!connected && !pending);
         name.setEnabled(!connected && !pending);
         host.setEnabled(!connected && !pending);
         port.setEnabled(!connected && !pending);

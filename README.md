@@ -31,12 +31,13 @@ javac --release 17 -encoding UTF-8 -d out $files
 
 ## Run on two laptops
 
-Use the same Wi-Fi network. Start the host with its Wi-Fi IPv4 address as the bind address, for example `java -cp target/classes lablink.Host 192.168.1.20 5050`. Enter that same address in both clients, including the client running on the host laptop. Each client binds its own UDP port and announces it over TCP. The local network must allow peer traffic.
+Use the same Wi-Fi network. Start the host with its Wi-Fi IPv4 address (or `0.0.0.0` to listen on all adapters), for example `java -cp target/classes lablink.Host 192.168.1.20 5050`. On each client, click **Scan LAN** to auto-discover active hosts via UDP multicast (`239.255.42.99:5051`) and subnet broadcast, select the room to fill the address and port, and click **Connect** (or type the address manually). Each client binds its own UDP port and announces it over TCP. The local network must allow peer traffic.
 
 ## Networking workflow
 
 | Feature | Implementation | Demonstration |
 | --- | --- | --- |
+| LAN auto-discovery | `Discovery` uses NIO `DatagramChannel`, `Selector`, IP multicast (`239.255.42.99:5051`), and `NetworkInterface` subnet broadcast probes. | Start `Host`, click **Scan LAN** in `Desktop`, and watch room occupancy update from `0/2` (`Open`) to `1/2` (`Waiting for player`). |
 | TCP client | `Connection` uses `java.net.Socket` for room commands and reliable events. | Join two clients and compare the final scores on both. |
 | Java NIO host | `Host` multiplexes non-blocking channels with a `Selector`, per-connection buffers, and queued writes. | Send half a request on one socket while another receives a response. |
 | UDP swing updates | The host streams sequenced angle samples with `DatagramSocket`. The client drops stale samples and interpolates the display between updates. | Start the host with a third argument of `7` to skip sample 7 for the second client. Its monitor reports the gap and keeps moving. |

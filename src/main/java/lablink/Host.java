@@ -22,9 +22,14 @@ public final class Host implements AutoCloseable {
     private final Queue<Runnable> changes = new ConcurrentLinkedQueue<>();
     private final Room room = new Room();
     private final int skipSample;
+    private final Discovery.Responder discovery;
     private volatile boolean running = true;
 
     public Host(String bind, int port, int skipSample) throws IOException {
+        this(bind, port, skipSample, port == 0 ? 0 : Discovery.DEFAULT_PORT);
+    }
+
+    public Host(String bind, int port, int skipSample, int discoveryPort) throws IOException {
         this.skipSample = skipSample;
         selector = Selector.open();
         ServerSocketChannel server = null;
@@ -42,10 +47,28 @@ public final class Host implements AutoCloseable {
         }
         listener = server;
         udp = datagrams;
+        Discovery.Responder responder = null;
+        if (discoveryPort >= 0) {
+            try {
+                responder = new Discovery.Responder(
+                        ((InetSocketAddress) listener.getLocalAddress()).getAddress(),
+                        ((InetSocketAddress) listener.getLocalAddress()).getPort(),
+                        discoveryPort,
+                        room::snapshot);
+            } catch (IOException exception) {
+                System.err.println("LAN discovery disabled on UDP port " + discoveryPort + ": "
+                        + exception.getMessage());
+            }
+        }
+        discovery = responder;
     }
 
     public int port() throws IOException {
         return ((InetSocketAddress) listener.getLocalAddress()).getPort();
+    }
+
+    public int discoveryPort() {
+        return discovery == null ? -1 : discovery.port();
     }
 
     private static final class Peer {
@@ -93,6 +116,7 @@ public final class Host implements AutoCloseable {
                 }
             }
         } finally {
+            if (discovery != null) discovery.close();
             workers.shutdownNow();
             clock.shutdownNow();
             udp.close();
@@ -456,6 +480,13 @@ public final class Host implements AutoCloseable {
             seats();
         }
 
+        synchronized Discovery.RoomSnapshot snapshot() {
+            String state = aborted ? "ABORTED" : finished ? "FINISHED" :
+                    players.isEmpty() ? "OPEN" : players.size() == 1 ? "WAITING" : "IN_GAME";
+            String hostName = players.isEmpty() ? "" : players.get(0).name;
+            return new Discovery.RoomSnapshot(players.size(), 2, round, state, hostName);
+        }
+
         private void broadcast(String message) {
             players.forEach(peer -> send(peer, message));
         }
@@ -489,6 +520,7 @@ public final class Host implements AutoCloseable {
     @Override
     public void close() {
         running = false;
+        if (discovery != null) discovery.close();
         selector.wakeup();
     }
 
@@ -496,9 +528,13 @@ public final class Host implements AutoCloseable {
         String bind = args.length > 0 ? args[0] : "127.0.0.1";
         int port = args.length > 1 ? Integer.parseInt(args[1]) : 5050;
         int skip = args.length > 2 ? Integer.parseInt(args[2]) : -1;
-        Host host = new Host(bind, port, skip);
+        int discoveryPort = args.length > 3 ? Integer.parseInt(args[3]) : Discovery.DEFAULT_PORT;
+        Host host = new Host(bind, port, skip, discoveryPort);
         Runtime.getRuntime().addShutdownHook(new Thread(host::close));
-        System.out.println("LabLink listening on " + bind + ":" + host.port());
+        String discoveryInfo = host.discoveryPort() > 0
+                ? " (LAN discovery UDP " + Discovery.MULTICAST_GROUP + ":" + host.discoveryPort() + ")"
+                : " (LAN discovery disabled)";
+        System.out.println("LabLink listening on " + bind + ":" + host.port() + discoveryInfo);
         host.serve();
     }
 }
