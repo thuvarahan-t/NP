@@ -223,7 +223,7 @@ public final class Discovery {
         while (interfaces.hasMoreElements()) {
             NetworkInterface ni = interfaces.nextElement();
             try {
-                if (!ni.isUp()) continue;
+                if (!ni.isUp() || ni.isLoopback() || ni.isPointToPoint()) continue;
                 boolean hasIpv4 = false;
                 for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
                     if (ia.getAddress() instanceof Inet4Address) {
@@ -237,6 +237,34 @@ public final class Discovery {
             }
         }
         return active;
+    }
+
+    static boolean sameIpv4Subnet(InetAddress first, InetAddress second, int prefixLength) {
+        if (!(first instanceof Inet4Address) || !(second instanceof Inet4Address)) return true;
+        if (prefixLength <= 0 || prefixLength > 32) return true;
+        int mask = prefixLength == 32 ? -1 : (-1 << (32 - prefixLength));
+        return (ipv4ToInt(first.getAddress()) & mask) == (ipv4ToInt(second.getAddress()) & mask);
+    }
+
+    private static int ipv4ToInt(byte[] octets) {
+        return ((octets[0] & 0xFF) << 24)
+                | ((octets[1] & 0xFF) << 16)
+                | ((octets[2] & 0xFF) << 8)
+                | (octets[3] & 0xFF);
+    }
+
+    private static int prefixLengthFor(InetAddress bindAddress) {
+        if (bindAddress.isAnyLocalAddress() || bindAddress.isLoopbackAddress()) return -1;
+        try {
+            NetworkInterface ni = NetworkInterface.getByInetAddress(bindAddress);
+            if (ni == null) return -1;
+            for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                if (bindAddress.equals(ia.getAddress())) return ia.getNetworkPrefixLength();
+            }
+        } catch (SocketException ignored) {
+            // Fall back to permissive subnet matching if inspection fails.
+        }
+        return -1;
     }
 
     private static boolean isLocalAddress(InetAddress address) {
@@ -256,6 +284,7 @@ public final class Discovery {
         private final DatagramChannel channel;
         private final Selector selector;
         private final InetAddress bindAddress;
+        private final int bindPrefixLength;
         private final int tcpPort;
         private final int boundPort;
         private final String serverId = randomHexId();
@@ -266,6 +295,7 @@ public final class Discovery {
         Responder(InetAddress bindAddress, int tcpPort, int discoveryPort, Supplier<RoomSnapshot> snapshot)
                 throws IOException {
             this.bindAddress = bindAddress;
+            this.bindPrefixLength = prefixLengthFor(bindAddress);
             this.tcpPort = tcpPort;
             this.snapshot = snapshot;
             DatagramChannel openedChannel = null;
@@ -277,7 +307,7 @@ public final class Discovery {
                 openedChannel.bind(new InetSocketAddress(discoveryPort));
                 this.boundPort = ((InetSocketAddress) openedChannel.getLocalAddress()).getPort();
                 InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
-                for (NetworkInterface ni : activeIpv4Interfaces()) {
+                for (NetworkInterface ni : responderInterfaces(bindAddress)) {
                     try {
                         if (ni.supportsMulticast()) openedChannel.join(group, ni);
                     } catch (IOException | UnsupportedOperationException ignored) {
@@ -330,6 +360,19 @@ public final class Discovery {
             }
         }
 
+        private static List<NetworkInterface> responderInterfaces(InetAddress bindAddress) {
+            if (bindAddress.isLoopbackAddress()) return List.of();
+            if (!bindAddress.isAnyLocalAddress()) {
+                try {
+                    NetworkInterface specific = NetworkInterface.getByInetAddress(bindAddress);
+                    if (specific != null && specific.isUp()) return List.of(specific);
+                } catch (SocketException ignored) {
+                    // Fall back to all active IPv4 interfaces.
+                }
+            }
+            return activeIpv4Interfaces();
+        }
+
         private void handleProbe(String message, InetSocketAddress remote) {
             String[] fields = message.split("\\|", -1);
             if (fields.length != 3) return;
@@ -338,7 +381,12 @@ public final class Discovery {
             String nonce = fields[2];
             if (!nonce.matches("[A-Za-z0-9_-]{1,32}")) return;
 
-            if (bindAddress.isLoopbackAddress() && !isLocalAddress(remote.getAddress())) return;
+            InetAddress sender = remote.getAddress();
+            if (bindAddress.isLoopbackAddress()) {
+                if (!isLocalAddress(sender)) return;
+            } else if (!bindAddress.isAnyLocalAddress()) {
+                if (!isLocalAddress(sender) && !sameIpv4Subnet(sender, bindAddress, bindPrefixLength)) return;
+            }
             String advertisedAddress = bindAddress.isLoopbackAddress() ? "127.0.0.1"
                     : bindAddress.isAnyLocalAddress() ? "" : bindAddress.getHostAddress();
 

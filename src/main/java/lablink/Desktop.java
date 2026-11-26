@@ -297,11 +297,12 @@ public final class Desktop {
                 + " & subnet broadcast", 12, false, MUTED));
         root.add(header, BorderLayout.NORTH);
 
-        JPanel listPanel = stack();
+        JPanel listPanel = new ScrollableListPanel();
         JScrollPane scroll = new JScrollPane(listPanel);
         scroll.setOpaque(false);
         scroll.getViewport().setOpaque(false);
         scroll.setBorder(BorderFactory.createEmptyBorder());
+        scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
         scroll.getVerticalScrollBar().setUnitIncrement(14);
         JPanel listSurface = surface(new BorderLayout());
         listSurface.add(scroll, BorderLayout.CENTER);
@@ -318,6 +319,14 @@ public final class Desktop {
         footer.add(actions, BorderLayout.EAST);
         root.add(footer, BorderLayout.SOUTH);
 
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke("ESCAPE"), "closeDialog");
+        root.getActionMap().put("closeDialog", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) {
+                dialog.dispose();
+            }
+        });
+
         Runnable runScan = () -> {
             rescan.setEnabled(false);
             scanStatus.setForeground(MUTED);
@@ -326,7 +335,7 @@ public final class Desktop {
             listPanel.add(label("Listening for LabLink hosts…", 13, false, MUTED));
             listPanel.revalidate();
             listPanel.repaint();
-            network.execute(() -> {
+            Thread scanThread = new Thread(() -> {
                 try {
                     java.util.List<Discovery.DiscoveredRoom> rooms = Discovery.scan();
                     SwingUtilities.invokeLater(() -> {
@@ -358,13 +367,17 @@ public final class Desktop {
                         scanStatus.setForeground(ERROR);
                         scanStatus.setText("LAN scan failed");
                         listPanel.removeAll();
-                        listPanel.add(label("Could not probe the network: " + exception.getMessage(),
-                                13, false, ERROR));
+                        JTextArea errorText = description();
+                        errorText.setForeground(ERROR);
+                        errorText.setText("Could not probe the network: " + exception.getMessage());
+                        listPanel.add(errorText);
                         listPanel.revalidate();
                         listPanel.repaint();
                     });
                 }
-            });
+            }, "LabLink LAN scan");
+            scanThread.setDaemon(true);
+            scanThread.start();
         };
 
         rescan.addActionListener(event -> runScan.run());
@@ -374,7 +387,35 @@ public final class Desktop {
         dialog.setVisible(true);
     }
 
+    private static final class ScrollableListPanel extends JPanel implements Scrollable {
+        ScrollableListPanel() {
+            setOpaque(false);
+            setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+        }
+
+        @Override public Dimension getPreferredScrollableViewportSize() {
+            return getPreferredSize();
+        }
+
+        @Override public int getScrollableUnitIncrement(Rectangle visibleRect, int orientation, int direction) {
+            return 16;
+        }
+
+        @Override public int getScrollableBlockIncrement(Rectangle visibleRect, int orientation, int direction) {
+            return 64;
+        }
+
+        @Override public boolean getScrollableTracksViewportWidth() {
+            return true;
+        }
+
+        @Override public boolean getScrollableTracksViewportHeight() {
+            return false;
+        }
+    }
+
     private JPanel roomCard(Discovery.DiscoveredRoom room, JDialog dialog) {
+        boolean joinable = room.joinable();
         JPanel card = new JPanel(new BorderLayout(10, 0)) {
             @Override protected void paintComponent(Graphics graphics) {
                 Graphics2D g = (Graphics2D) graphics.create();
@@ -382,7 +423,7 @@ public final class Desktop {
                 Shape pill = new RoundRectangle2D.Double(1, 1, getWidth() - 2.0, getHeight() - 2.0, 14, 14);
                 g.setColor(WHITE);
                 g.fill(pill);
-                g.setColor(room.joinable() ? new Color(117, 235, 212, 90) : LINE);
+                g.setColor(joinable ? new Color(117, 235, 212, 90) : LINE);
                 g.draw(pill);
                 g.dispose();
             }
@@ -391,14 +432,15 @@ public final class Desktop {
         card.setBorder(new EmptyBorder(10, 12, 10, 12));
         card.setAlignmentX(Component.LEFT_ALIGNMENT);
         card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 68));
-        card.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        if (joinable) card.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
         JPanel info = stack();
         JPanel top = transparent(new BorderLayout(8, 0));
         top.setAlignmentX(Component.LEFT_ALIGNMENT);
+        top.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
         top.add(label(room.displayTitle(), 14, true, INK), BorderLayout.WEST);
         top.add(label(room.statusLabel() + " · " + room.players() + "/" + room.maxPlayers(),
-                12, true, room.joinable() ? GREEN : MUTED), BorderLayout.EAST);
+                12, true, joinable ? GREEN : MUTED), BorderLayout.EAST);
         info.add(top);
         info.add(Box.createVerticalStrut(4));
         JLabel meta = label(room.address() + ":" + room.port() + "  ·  Round " + room.round()
@@ -407,21 +449,24 @@ public final class Desktop {
         info.add(meta);
         card.add(info, BorderLayout.CENTER);
 
-        JButton select = button("Select");
-        Runnable pickRoom = () -> {
-            host.setText(room.address());
-            port.setText(Integer.toString(room.port()));
-            feedback.setText(" ");
-            notifyPlayer("Selected " + room.address() + ":" + room.port() + " · Click Connect");
-            dialog.dispose();
-        };
-        select.addActionListener(event -> pickRoom.run());
+        JButton select = button(joinable ? "Select" : "IN_GAME".equals(room.state()) ? "Full" : "Busy");
+        select.setEnabled(joinable);
         card.add(select, BorderLayout.EAST);
-        card.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent event) {
-                pickRoom.run();
-            }
-        });
+        if (joinable) {
+            Runnable pickRoom = () -> {
+                host.setText(room.address());
+                port.setText(Integer.toString(room.port()));
+                feedback.setText(" ");
+                notifyPlayer("Selected " + room.address() + ":" + room.port() + " · Click Connect");
+                dialog.dispose();
+            };
+            select.addActionListener(event -> pickRoom.run());
+            card.addMouseListener(new MouseAdapter() {
+                @Override public void mouseClicked(MouseEvent event) {
+                    pickRoom.run();
+                }
+            });
+        }
         return card;
     }
 

@@ -109,7 +109,7 @@ public final class WorkflowCheck {
         check(trace.angleAt(start + 2_100_000_000) == 50, "Finish at release angle");
     }
 
-    private static void checkDiscoveryParsing() {
+    private static void checkDiscoveryParsing() throws Exception {
         var explicit = Discovery.parseReply(
                 "LABLINK_HOST|1|abc12345|srv01|192.168.1.20|5050|1|2|3|WAITING|Asha",
                 "127.0.0.1", "abc12345", 4);
@@ -122,6 +122,19 @@ public final class WorkflowCheck {
                 "192.168.1.44", "abc12345", 2);
         check(resolved != null && "192.168.1.44".equals(resolved.address()) && resolved.joinable(),
                 "Wildcard reply resolves sender IP");
+
+        var busy = Discovery.parseReply(
+                "LABLINK_HOST|1|abc12345|srv01|192.168.1.20|5050|2|2|1|FINISHED|Asha",
+                "127.0.0.1", "abc12345", 3);
+        check(busy != null && !busy.joinable() && "Round finished".equals(busy.statusLabel()),
+                "Finished room marked unjoinable");
+
+        check(Discovery.sameIpv4Subnet(
+                InetAddress.getByName("192.168.1.20"), InetAddress.getByName("192.168.1.99"), 24),
+                "Matching /24 subnet accepted");
+        check(!Discovery.sameIpv4Subnet(
+                InetAddress.getByName("192.168.1.20"), InetAddress.getByName("192.168.56.101"), 24),
+                "Unrelated /24 subnet rejected");
 
         check(Discovery.parseReply("LABLINK_HOST|1|wrong|srv01|127.0.0.1|5050|0|2|1|OPEN|",
                 "127.0.0.1", "abc12345", 1) == null, "Mismatched nonce ignored");
